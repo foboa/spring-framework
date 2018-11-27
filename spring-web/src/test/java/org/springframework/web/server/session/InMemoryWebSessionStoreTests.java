@@ -1,5 +1,5 @@
 /*
- * Copyright 2002-2017 the original author or authors.
+ * Copyright 2002-2018 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,47 +15,36 @@
  */
 package org.springframework.web.server.session;
 
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Map;
+import java.util.stream.IntStream;
+
 import org.junit.Test;
 
+import org.springframework.beans.DirectFieldAccessor;
 import org.springframework.web.server.WebSession;
 
+import static junit.framework.TestCase.assertSame;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 /**
- * Unit tests.
+ * Unit tests for {@link InMemoryWebSessionStore}.
  * @author Rob Winch
  */
 public class InMemoryWebSessionStoreTests {
 
-	private InMemoryWebSessionStore sessionStore = new InMemoryWebSessionStore();
+	private InMemoryWebSessionStore store = new InMemoryWebSessionStore();
 
-
-	@Test
-	public void constructorWhenImplicitStartCopiedThenCopyIsStarted() {
-		WebSession original = this.sessionStore.createWebSession().block();
-		assertNotNull(original);
-		original.getAttributes().put("foo", "bar");
-
-		WebSession copy = this.sessionStore.updateLastAccessTime(original).block();
-		assertNotNull(copy);
-		assertTrue(copy.isStarted());
-	}
-
-	@Test
-	public void constructorWhenExplicitStartCopiedThenCopyIsStarted() {
-		WebSession original = this.sessionStore.createWebSession().block();
-		assertNotNull(original);
-		original.start();
-
-		WebSession copy = this.sessionStore.updateLastAccessTime(original).block();
-		assertNotNull(copy);
-		assertTrue(copy.isStarted());
-	}
 
 	@Test
 	public void startsSessionExplicitly() {
-		WebSession session = this.sessionStore.createWebSession().block();
+		WebSession session = this.store.createWebSession().block();
 		assertNotNull(session);
 		session.start();
 		assertTrue(session.isStarted());
@@ -63,11 +52,118 @@ public class InMemoryWebSessionStoreTests {
 
 	@Test
 	public void startsSessionImplicitly() {
-		WebSession session = this.sessionStore.createWebSession().block();
+		WebSession session = this.store.createWebSession().block();
 		assertNotNull(session);
 		session.start();
 		session.getAttributes().put("foo", "bar");
 		assertTrue(session.isStarted());
+	}
+
+	@Test
+	public void retrieveExpiredSession() {
+		WebSession session = this.store.createWebSession().block();
+		assertNotNull(session);
+		session.getAttributes().put("foo", "bar");
+		session.save().block();
+
+		String id = session.getId();
+		WebSession retrieved = this.store.retrieveSession(id).block();
+		assertNotNull(retrieved);
+		assertSame(session, retrieved);
+
+		// Fast-forward 31 minutes
+		this.store.setClock(Clock.offset(this.store.getClock(), Duration.ofMinutes(31)));
+		WebSession retrievedAgain = this.store.retrieveSession(id).block();
+		assertNull(retrievedAgain);
+	}
+
+	@Test
+	public void lastAccessTimeIsUpdatedOnRetrieve() {
+		WebSession session1 = this.store.createWebSession().block();
+		assertNotNull(session1);
+		String id = session1.getId();
+		Instant time1 = session1.getLastAccessTime();
+		session1.start();
+		session1.save().block();
+
+		// Fast-forward a few seconds
+		this.store.setClock(Clock.offset(this.store.getClock(), Duration.ofSeconds(5)));
+
+		WebSession session2 = this.store.retrieveSession(id).block();
+		assertNotNull(session2);
+		assertSame(session1, session2);
+		Instant time2 = session2.getLastAccessTime();
+		assertTrue(time1.isBefore(time2));
+	}
+
+	@Test // SPR-17051
+	public void sessionInvalidatedBeforeSave() {
+		// Request 1 creates session
+		WebSession session1 = this.store.createWebSession().block();
+		assertNotNull(session1);
+		String id = session1.getId();
+		session1.start();
+		session1.save().block();
+
+		// Request 2 retrieves session
+		WebSession session2 = this.store.retrieveSession(id).block();
+		assertNotNull(session2);
+		assertSame(session1, session2);
+
+		// Request 3 retrieves and invalidates
+		WebSession session3 = this.store.retrieveSession(id).block();
+		assertNotNull(session3);
+		assertSame(session1, session3);
+		session3.invalidate().block();
+
+		// Request 2 saves session after invalidated
+		session2.save().block();
+
+		// Session should not be present
+		WebSession session4 = this.store.retrieveSession(id).block();
+		assertNull(session4);
+	}
+
+	@Test
+	public void expirationCheckPeriod() {
+
+		DirectFieldAccessor accessor = new DirectFieldAccessor(this.store);
+		Map<?,?> sessions = (Map<?, ?>) accessor.getPropertyValue("sessions");
+		assertNotNull(sessions);
+
+		// Create 100 sessions
+		IntStream.range(0, 100).forEach(i -> insertSession());
+		assertEquals(100, sessions.size());
+
+		// Force a new clock (31 min later), don't use setter which would clean expired sessions
+		accessor.setPropertyValue("clock", Clock.offset(this.store.getClock(), Duration.ofMinutes(31)));
+		assertEquals(100, sessions.size());
+
+		// Create 1 more which forces a time-based check (clock moved forward)
+		insertSession();
+		assertEquals(1, sessions.size());
+	}
+
+	@Test
+	public void maxSessions() {
+
+		IntStream.range(0, 10000).forEach(i -> insertSession());
+
+		try {
+			insertSession();
+			fail();
+		}
+		catch (IllegalStateException ex) {
+			assertEquals("Max sessions limit reached: 10000", ex.getMessage());
+		}
+	}
+
+	private WebSession insertSession() {
+		WebSession session = this.store.createWebSession().block();
+		assertNotNull(session);
+		session.start();
+		session.save().block();
+		return session;
 	}
 
 }
